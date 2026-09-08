@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+langgraph
+langgraph-checkpoint-postgres
+psycopg[binary,pool]
+pydantic
+pytest
+httpx
+python-dotenv
