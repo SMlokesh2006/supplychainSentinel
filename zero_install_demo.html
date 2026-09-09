@@ -40,18 +40,48 @@
         const { useState, useEffect, useRef } = React;
         const API_URL = "http://localhost:8000";
 
+        // Error Boundary to prevent blank page on uncaught errors
+        class ErrorBoundary extends React.Component {
+            constructor(props) {
+                super(props);
+                this.state = { hasError: false, error: null };
+            }
+            static getDerivedStateFromError(error) {
+                return { hasError: true, error };
+            }
+            componentDidCatch(error, errorInfo) {
+                console.error("ErrorBoundary caught:", error, errorInfo);
+            }
+            render() {
+                if (this.state.hasError) {
+                    return React.createElement('div', {className: "p-8 text-center"},
+                        React.createElement('h2', {className: "text-xl font-bold text-red-600 mb-2"}, "Something went wrong"),
+                        React.createElement('p', {className: "text-gray-600 mb-4"}, this.state.error?.message || "An unexpected error occurred."),
+                        React.createElement('button', {
+                            className: "bg-blue-600 text-white px-4 py-2 rounded-lg",
+                            onClick: () => this.setState({ hasError: false, error: null })
+                        }, "Try Again")
+                    );
+                }
+                return this.props.children;
+            }
+        }
         // Helper components
         function Icon({ name, className }) {
             const iconRef = useRef(null);
+            // Convert camelCase to kebab-case: CheckCircle2 -> check-circle-2
+            const kebabName = name ? name.replace(/([a-z0-9])([A-Z])/g, '$1-$2').replace(/([A-Z])(\d)/g, '$1-$2').toLowerCase() : '';
             useEffect(() => {
                 if (window.lucide && iconRef.current) {
-                    window.lucide.createIcons({
-                        root: iconRef.current.parentNode,
-                        nameAttr: 'data-lucide'
-                    });
+                    try {
+                        window.lucide.createIcons({
+                            root: iconRef.current.parentNode,
+                            nameAttr: 'data-lucide'
+                        });
+                    } catch (e) { /* icon not found, ignore */ }
                 }
             }, [name]);
-            return <i ref={iconRef} className={className} data-lucide={name.toLowerCase()}></i>;
+            return <i ref={iconRef} className={className} data-lucide={kebabName}></i>;
         }
 
         // --- Visualizations ---
@@ -234,9 +264,9 @@
                 if (threads.length === 0) return;
                 try {
                     const results = await Promise.all(
-                        threads.map(id => fetch(`${API_URL}/cases/${id}`).then(r => r.ok ? r.json() : null))
+                        threads.map(id => fetch(`${API_URL}/cases/${id}`).then(r => r.ok ? r.json() : null).catch(() => null))
                     );
-                    const valid = results.filter(Boolean).map(c => ({ thread_id: c.thread_id, ...c.state }));
+                    const valid = results.filter(Boolean).map(c => ({ thread_id: c.thread_id, next: c.next || [], ...c.state }));
                     setAllCases(valid.reverse());
                 } catch (e) { console.error(e); }
             };
@@ -269,9 +299,11 @@
                         </div>
                     </header>
                     <main className="flex-1 max-w-7xl mx-auto w-full px-4 py-8">
-                        {view === "dashboard" && <Dashboard navigate={navigate} allCases={allCases} pendingCases={pendingCases} saveTracked={saveTracked} />}
-                        {view === "case" && <CaseDetail threadId={activeThread} allCases={allCases} onRefresh={pollAll} />}
-                        {view === "approvals" && <Approvals pendingCases={pendingCases} navigate={navigate} />}
+                        <ErrorBoundary>
+                            {view === "dashboard" && <Dashboard navigate={navigate} allCases={allCases} pendingCases={pendingCases} saveTracked={saveTracked} />}
+                            {view === "case" && <CaseDetail threadId={activeThread} allCases={allCases} onRefresh={pollAll} />}
+                            {view === "approvals" && <Approvals pendingCases={pendingCases} navigate={navigate} />}
+                        </ErrorBoundary>
                     </main>
                 </div>
             );
@@ -445,19 +477,23 @@
             const execution = caseData.execution_result;
 
             const handleApprove = async (idx) => {
-                await fetch(`${API_URL}/cases/${threadId}/approve`, {
-                    method: "POST", headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ approved_by: "Demo User", selected_option_index: idx })
-                });
-                onRefresh();
+                try {
+                    await fetch(`${API_URL}/cases/${threadId}/approve`, {
+                        method: "POST", headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ approved_by: "Demo User", selected_option_index: idx })
+                    });
+                    onRefresh();
+                } catch (e) { console.error("Approve failed:", e); }
             };
 
             const handleReject = async () => {
-                await fetch(`${API_URL}/cases/${threadId}/reject`, {
-                    method: "POST", headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ approved_by: "Demo User", reason: "Rejected via UI" })
-                });
-                onRefresh();
+                try {
+                    await fetch(`${API_URL}/cases/${threadId}/reject`, {
+                        method: "POST", headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ approved_by: "Demo User", reason: "Rejected via UI" })
+                    });
+                    onRefresh();
+                } catch (e) { console.error("Reject failed:", e); }
             };
 
             return (
@@ -552,7 +588,7 @@
                                     )}
                                     {p.risk_reasoning && (
                                         <div className="bg-amber-50 p-3 rounded-lg border border-amber-100">
-                                            <p className="text-xs text-amber-800 font-medium">{p.risk_reasoning.replace(/\[.*?\] /, '')}</p>
+                                            <p className="text-xs text-amber-800 font-medium">{String(p.risk_reasoning).replace(/\[.*?\] /, '')}</p>
                                         </div>
                                     )}
                                 </div>

@@ -26,43 +26,54 @@ WEIGHT_COST = 0.30
 WEIGHT_TIME = 0.20
 WEIGHT_RISK = 0.50
 
-# ---------------------------------------------------------------------------
-# Risk keyword mapping  (qualitative → numeric, 0.0 = low, 1.0 = very high)
-#
-# SIMPLIFICATION NOTE: This is a keyword-based heuristic, not an ML model.
-# It is intentionally explicit and auditable so the mapping can be explained
-# during a live demo.  Keywords are checked in order from HIGH → LOW so that
-# the most severe signal wins if multiple keywords appear in the same note.
-# ---------------------------------------------------------------------------
-_RISK_KEYWORD_MAP = [
-    # (substring_to_match_case_insensitive, numeric_risk_value)
-    ("dangerous goods",          1.0),   # DG-certified cargo — highest operational risk
-    ("very high cost",           0.85),  # proxy: cost pressure often tracks risk exposure
-    ("higher congestion",        0.75),  # port congestion = delay AND damage risk
-    ("wait out",                 0.65),  # weather-hold at origin — moderate uncertainty
-    ("lowest cost but highest",  0.70),  # explicit "highest delay" language
-    ("avoids",                   0.30),  # route explicitly designed to avoid hazard
-    ("proven reliability",       0.20),  # carrier's own confidence claim
-    ("bypassing",                0.25),  # complete avoidance of disruption zone
-    ("expedited",                0.40),  # faster but operationally complex
-    ("fallback",                 0.50),  # generic fallback — unknown reliability
-]
-_RISK_DEFAULT = 0.55  # applied when no keyword matches (assume moderate risk)
+import os
+from langchain_groq import ChatGroq
+from langchain_core.messages import SystemMessage, HumanMessage
 
+# ---------------------------------------------------------------------------
+# Risk Evaluation via Groq LLM
+#
+# This function dynamically calls a Llama 3 model via Groq to evaluate
+# the operational risk of a route based on the qualitative note.
+# ---------------------------------------------------------------------------
+_RISK_DEFAULT = 0.55  # applied as fallback if LLM call fails
 
 def _risk_note_to_numeric(risk_note: str) -> float:
     """Convert a qualitative risk_note string to a numeric value [0.0, 1.0].
 
-    Uses ordered keyword matching (first match wins, highest-risk keywords
-    listed first).  This is a deliberate simplification — the mapping is
-    documented here so it can be reviewed and tuned independently of the
-    scoring weights above.
+    Uses a fast LLM to rate the risk based on the nuanced meaning of the text.
     """
-    lower = risk_note.lower()
-    for keyword, value in _RISK_KEYWORD_MAP:
-        if keyword in lower:
-            return value
-    return _RISK_DEFAULT
+    if not risk_note or not risk_note.strip():
+        return _RISK_DEFAULT
+
+    try:
+        # Initialize Groq LLM
+        # Requires GROQ_API_KEY in the environment
+        llm = ChatGroq(model="llama3-8b-8192", temperature=0.0, max_tokens=10)
+        
+        system_prompt = (
+            "You are an expert supply chain risk evaluator. "
+            "You will be given a qualitative risk note from a freight carrier. "
+            "Your job is to rate the operational risk of this route on a scale from 0.0 to 1.0, "
+            "where 0.0 is completely safe and reliable, and 1.0 is extremely high risk "
+            "(e.g., dangerous goods, active storms, severe congestion). "
+            "Return ONLY a single float number between 0.0 and 1.0. Do not include any other text."
+        )
+        
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"Risk note: {risk_note}")
+        ])
+        
+        # Parse the output
+        content = response.content.strip()
+        risk_value = float(content)
+        
+        # Clamp between 0.0 and 1.0
+        return max(0.0, min(1.0, risk_value))
+    except Exception as e:
+        print(f"LLM risk evaluation failed: {e}")
+        return _RISK_DEFAULT
 
 
 def _estimate_penalty_exposure(transit_time_days: int, penalty_terms: dict) -> float:
