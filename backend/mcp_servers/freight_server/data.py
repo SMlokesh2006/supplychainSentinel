@@ -53,6 +53,27 @@ ROUTES_DB = {
             "estimated_transit_time_days": 16,
             "qualitative_risk_note": "Avoids northern storm tracks. Proven reliability."
         }
+    ],
+    # SHP-2026-005 — Cotton textiles, SLA deadline 2026-09-30, USD 500/day penalty.
+    # With a 16-day transit from today (2026-09-09) the shipment arrives 2026-09-25,
+    # five days ahead of the SLA, so penalty_exposure = 0.  The southern sea route
+    # costs USD 3,200 and carries a 'proven reliability' risk_note (risk_numeric=0.20).
+    # This makes it a guaranteed low-risk / auto-execute candidate for Phase 5 testing.
+    "SHP-2026-005": [
+        {
+            "route_id": "ALT-1",
+            "carrier": "Indian Ocean Express",
+            "estimated_cost_usd": 3200,
+            "estimated_transit_time_days": 16,
+            "qualitative_risk_note": "Southern sea route avoids congestion zone. Proven reliability on this corridor."
+        },
+        {
+            "route_id": "ALT-2",
+            "carrier": "Air Freight Priority",
+            "estimated_cost_usd": 9500,
+            "estimated_transit_time_days": 4,
+            "qualitative_risk_note": "Air freight bypassing sea port. Faster but higher cost relative to cargo value."
+        }
     ]
 }
 

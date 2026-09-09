@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SupplyChain Sentinel Demo</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: { brand: { 900: '#1e3a8a' } }
+                }
+            }
+        }
+    </script>
+    <!-- React & Babel -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {
+            background-color: #FAFAFA;
+            color: #1A1F2C;
+            font-family: ui-sans-serif, system-ui, sans-serif;
+        }
+        .fade-in { animation: fadeIn 0.5s ease-in-out; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module">
+        const { useState, useEffect, useRef } = React;
+        const API_URL = "http://localhost:8000";
+
+        // Helper components
+        function Icon({ name, className }) {
+            const iconRef = useRef(null);
+            useEffect(() => {
+                if (window.lucide && iconRef.current) {
+                    window.lucide.createIcons({
+                        root: iconRef.current.parentNode,
+                        nameAttr: 'data-lucide'
+                    });
+                }
+            }, [name]);
+            return <i ref={iconRef} className={className} data-lucide={name.toLowerCase()}></i>;
+        }
+
+        // --- Visualizations ---
+        function DashboardChart({ allCases }) {
+            const chartRef = useRef(null);
+            const chartInstance = useRef(null);
+
+            useEffect(() => {
+                if (!chartRef.current) return;
+                const ctx = chartRef.current.getContext('2d');
+                
+                const dataCounts = {
+                    'auto_executed': allCases.filter(c => c.status === 'auto_executed').length,
+                    'executed': allCases.filter(c => c.status === 'executed').length,
+                    'rejected': allCases.filter(c => c.status === 'rejected').length,
+                    'pending': allCases.filter(c => !['auto_executed', 'executed', 'rejected'].includes(c.status)).length,
+                };
+
+                if (chartInstance.current) chartInstance.current.destroy();
+
+                chartInstance.current = new Chart(ctx, {
+                    type: 'doughnut',
+                    data: {
+                        labels: ['Auto-Executed', 'Executed (Manual)', 'Rejected', 'Pending Review'],
+                        datasets: [{
+                            data: [dataCounts.auto_executed, dataCounts.executed, dataCounts.rejected, dataCounts.pending],
+                            backgroundColor: ['#8b5cf6', '#22c55e', '#ef4444', '#f59e0b'],
+                            borderWidth: 0
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { position: 'right' } }
+                    }
+                });
+            }, [allCases]);
+
+            return (
+                <div className="bg-white p-6 rounded-xl border border-gray-200 shadow-sm">
+                    <h3 className="text-lg font-semibold mb-4">Case Resolutions</h3>
+                    <div className="h-64"><canvas ref={chartRef}></canvas></div>
+                </div>
+            );
+        }
+
+        function RouteComparisonChart({ routeOptions }) {
+            const chartRef = useRef(null);
+            const chartInstance = useRef(null);
+
+            useEffect(() => {
+                if (!chartRef.current || !routeOptions || routeOptions.length === 0) return;
+                const ctx = chartRef.current.getContext('2d');
+
+                const labels = routeOptions.map(r => r.carrier);
+                const costs = routeOptions.map(r => r.cost);
+                const times = routeOptions.map(r => r.transit_time_days);
+
+                if (chartInstance.current) chartInstance.current.destroy();
+
+                chartInstance.current = new Chart(ctx, {
+                    type: 'bar',
+                    data: {
+                        labels: labels,
+                        datasets: [
+                            {
+                                label: 'Cost (USD)',
+                                data: costs,
+                                backgroundColor: '#3b82f6',
+                                yAxisID: 'y'
+                            },
+                            {
+                                label: 'Transit Time (Days)',
+                                data: times,
+                                backgroundColor: '#f59e0b',
+                                yAxisID: 'y1'
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            y: { type: 'linear', display: true, position: 'left', title: { display: true, text: 'Cost' } },
+                            y1: { type: 'linear', display: true, position: 'right', grid: { drawOnChartArea: false }, title: { display: true, text: 'Days' } }
+                        }
+                    }
+                });
+            }, [routeOptions]);
+
+            return (
+                <div className="bg-white p-6 rounded-xl border border-gray-200 shadow-sm mt-6">
+                    <h3 className="text-lg font-semibold mb-4">Route Comparison</h3>
+                    <div className="h-64"><canvas ref={chartRef}></canvas></div>
+                </div>
+            );
+        }
+
+        function StepTracker({ status, riskTier }) {
+            const steps = [
+                { key: "ingest", label: "Signal Ingested", active: true },
+                { key: "context", label: "Context Gathered", active: !["created", "context_gathering"].includes(status) },
+                { key: "routes", label: "Routes Generated", active: !["created", "context_gathering", "ready_for_routing"].includes(status) },
+                { key: "tier", label: "Tiered Autonomy Check", active: !["created", "context_gathering", "ready_for_routing", "routes_ready"].includes(status) },
+            ];
+
+            let finalStep = { key: "exec", label: "Auto-Executed", active: status === "auto_executed", color: "green" };
+            
+            if (riskTier === "high" || ["awaiting_approval", "approved", "rejected", "executed"].includes(status)) {
+                if (status === "awaiting_approval") finalStep = { key: "exec", label: "Awaiting Approval", active: true, color: "amber" };
+                else if (status === "rejected") finalStep = { key: "exec", label: "Rejected", active: true, color: "red" };
+                else if (["approved", "executed"].includes(status)) finalStep = { key: "exec", label: "Executed (Approved)", active: true, color: "purple" };
+                else finalStep = { key: "exec", label: "Pending Review", active: false, color: "gray" };
+            }
+
+            const allSteps = [...steps, finalStep];
+
+            return (
+                <div className="flex items-center justify-between min-w-[600px] py-4">
+                    {allSteps.map((step, idx) => {
+                        const isLast = idx === allSteps.length - 1;
+                        const colorClass = step.active ? (step.color === 'amber' ? 'bg-amber-500' : step.color === 'red' ? 'bg-red-500' : step.color === 'purple' ? 'bg-purple-600' : 'bg-blue-600') : 'bg-gray-200';
+                        const textColor = step.active ? 'text-gray-900 font-semibold' : 'text-gray-400';
+                        
+                        return (
+                            <div key={step.key} className="flex items-center flex-1 last:flex-none">
+                                <div className="flex flex-col items-center relative z-10 w-32">
+                                    <div className={`w-10 h-10 rounded-full flex items-center justify-center ${colorClass} text-white shadow-sm transition-colors duration-500`}>
+                                        {step.active && step.key !== 'exec' ? <Icon name="CheckCircle2" className="w-6 h-6" /> : (idx + 1)}
+                                    </div>
+                                    <span className={`text-xs mt-3 text-center transition-colors duration-500 ${textColor}`}>
+                                        {step.label}
+                                    </span>
+                                </div>
+                                {!isLast && (
+                                    <div className="flex-1 h-1 mx-[-1rem] bg-gray-200 relative top-[-10px] z-0">
+                                        <div className={`h-full transition-all duration-1000 ${allSteps[idx+1].active ? 'bg-blue-600' : 'bg-transparent'}`} />
+                                    </div>
+                                )}
+                            </div>
+                        );
+                    })}
+                </div>
+            );
+        }
+
+        // --- Main App ---
+                function App() {
+            const [view, setView] = useState("dashboard");
+            const [activeThread, setActiveThread] = useState(null);
+            const [trackedThreads, setTrackedThreads] = useState(() => JSON.parse(localStorage.getItem('trackedThreads') || '[]'));
+            const [pendingCases, setPendingCases] = useState([]);
+            const [allCases, setAllCases] = useState([]);
+            
+            const trackedRef = React.useRef(trackedThreads);
+            useEffect(() => { trackedRef.current = trackedThreads; }, [trackedThreads]);
+
+            const saveTracked = (id) => {
+                setTrackedThreads(prev => {
+                    if (prev.includes(id)) return prev;
+                    const updated = [...prev, id];
+                    localStorage.setItem('trackedThreads', JSON.stringify(updated));
+                    return updated;
+                });
+            };
+
+            const pollPending = async () => {
+                try {
+                    const res = await fetch(`${API_URL}/cases/pending-approval`);
+                    if (res.ok) {
+                        const data = await res.json();
+                        setPendingCases(data.pending_cases || []);
+                        data.pending_cases?.forEach(c => saveTracked(c.thread_id));
+                    }
+                } catch (e) { console.error(e); }
+            };
+
+            const pollAll = async () => {
+                const threads = trackedRef.current;
+                if (threads.length === 0) return;
+                try {
+                    const results = await Promise.all(
+                        threads.map(id => fetch(`${API_URL}/cases/${id}`).then(r => r.ok ? r.json() : null))
+                    );
+                    const valid = results.filter(Boolean).map(c => ({ thread_id: c.thread_id, ...c.state }));
+                    setAllCases(valid.reverse());
+                } catch (e) { console.error(e); }
+            };
+
+            useEffect(() => {
+                pollPending();
+                pollAll();
+                const int1 = setInterval(pollPending, 3000);
+                const int2 = setInterval(pollAll, 3000);
+                return () => { clearInterval(int1); clearInterval(int2); };
+            }, []);
+
+            const navigate = (newView, threadId = null) => {
+                setView(newView);
+                if (threadId) setActiveThread(threadId);
+            };
+
+            return (
+                <div className="min-h-screen flex flex-col fade-in">
+                    <header className="bg-white border-b border-gray-200 sticky top-0 z-50">
+                        <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
+                            <div className="flex items-center gap-2 text-brand-900 cursor-pointer" onClick={() => navigate("dashboard")}>
+                                <Icon name="Shield" className="w-6 h-6 text-brand-900" />
+                                <span className="font-bold text-lg">SupplyChain Sentinel</span>
+                            </div>
+                            <nav className="flex items-center gap-6 text-sm font-medium">
+                                <button onClick={() => navigate("dashboard")} className={`hover:text-brand-900 ${view === 'dashboard' ? 'text-brand-900 font-bold' : 'text-gray-600'}`}>Dashboard</button>
+                                <button onClick={() => navigate("approvals")} className={`hover:text-brand-900 ${view === 'approvals' ? 'text-brand-900 font-bold' : 'text-gray-600'}`}>Approvals Queue</button>
+                            </nav>
+                        </div>
+                    </header>
+                    <main className="flex-1 max-w-7xl mx-auto w-full px-4 py-8">
+                        {view === "dashboard" && <Dashboard navigate={navigate} allCases={allCases} pendingCases={pendingCases} saveTracked={saveTracked} />}
+                        {view === "case" && <CaseDetail threadId={activeThread} allCases={allCases} onRefresh={pollAll} />}
+                        {view === "approvals" && <Approvals pendingCases={pendingCases} navigate={navigate} />}
+                    </main>
+                </div>
+            );
+        }
+
+        function Dashboard({ navigate, allCases, pendingCases, saveTracked }) {
+            const [triggering, setTriggering] = useState(false);
+            const [shipmentId, setShipmentId] = useState("SHP-2026-001");
+
+            const triggerReactive = async () => {
+                setTriggering(true);
+                try {
+                    const res = await fetch(`${API_URL}/cases/trigger/reactive`, {
+                        method: "POST", headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ shipment_id: shipmentId, disruption_description: "Dashboard simulated alert" })
+                    });
+                    const data = await res.json();
+                    if (data.thread_id) {
+                        saveTracked(data.thread_id);
+                        navigate("case", data.thread_id);
+                    }
+                } catch (e) { alert("Trigger failed. Backend running?"); }
+                finally { setTriggering(false); }
+            };
+
+            const triggerProactive = async () => {
+                setTriggering(true);
+                try {
+                    const res = await fetch(`${API_URL}/cases/trigger/proactive-scan`, { method: "POST" });
+                    const data = await res.json();
+                    if (data.created_cases?.length > 0) {
+                        data.created_cases.forEach(c => saveTracked(c.thread_id));
+                        navigate("case", data.created_cases[0].thread_id);
+                    } else alert("Scan completed. No affected shipments.");
+                } catch (e) { alert("Scan failed."); } 
+                finally { setTriggering(false); }
+            };
+
+            return (
+                <div className="space-y-8 fade-in">
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                        <div className="bg-white p-5 rounded-xl border border-gray-200 shadow-sm flex items-center justify-between">
+                            <div><p className="text-sm font-medium text-gray-500">Active Cases tracked</p><p className="text-3xl font-bold">{allCases.length}</p></div>
+                            <div className="p-3 rounded-full bg-blue-50"><Icon name="Activity" className="w-6 h-6 text-blue-500" /></div>
+                        </div>
+                        <div className={`bg-white p-5 rounded-xl border shadow-sm flex items-center justify-between ${pendingCases.length > 0 ? 'border-amber-300 shadow-amber-100' : 'border-gray-200'}`}>
+                            <div><p className="text-sm font-medium text-gray-500">Pending Approvals</p><p className="text-3xl font-bold text-amber-600">{pendingCases.length}</p></div>
+                            <div className="p-3 rounded-full bg-amber-50"><Icon name="Clock" className="w-6 h-6 text-amber-500" /></div>
+                        </div>
+                        <div className="bg-white p-5 rounded-xl border border-gray-200 shadow-sm flex items-center justify-between">
+                            <div><p className="text-sm font-medium text-gray-500">Auto-Executed</p><p className="text-3xl font-bold">{allCases.filter(c => c.status === 'auto_executed').length}</p></div>
+                            <div className="p-3 rounded-full bg-purple-50"><Icon name="Play" className="w-6 h-6 text-purple-500" /></div>
+                        </div>
+                        <div className="bg-white p-5 rounded-xl border border-gray-200 shadow-sm flex items-center justify-between">
+                            <div><p className="text-sm font-medium text-gray-500">Resolved</p><p className="text-3xl font-bold">{allCases.filter(c => ['executed', 'auto_executed', 'rejected'].includes(c.status)).length}</p></div>
+                            <div className="p-3 rounded-full bg-green-50"><Icon name="CheckCircle2" className="w-6 h-6 text-green-500" /></div>
+                        </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                        <div className="lg:col-span-2 space-y-8">
+                            
+                            <DashboardChart allCases={allCases} />
+
+                            <section>
+                                <h2 className="text-xl font-semibold mb-4 flex items-center gap-2">
+                                    Action Required
+                                    {pendingCases.length > 0 && <span className="bg-amber-100 text-amber-800 text-xs font-bold px-2 py-0.5 rounded-full">{pendingCases.length}</span>}
+                                </h2>
+                                {pendingCases.length === 0 ? (
+                                    <div className="p-8 bg-white rounded-xl border border-gray-200 text-center text-gray-500 shadow-sm">
+                                        <Icon name="CheckCircle2" className="w-10 h-10 mx-auto text-green-400 mb-2" />
+                                        <p>No cases awaiting human approval. All clear.</p>
+                                    </div>
+                                ) : (
+                                    <div className="space-y-3">
+                                        {pendingCases.map(c => (
+                                            <div key={c.thread_id} className="bg-white p-5 rounded-xl border border-amber-200 shadow-sm flex justify-between items-center border-l-4 border-l-amber-400">
+                                                <div>
+                                                    <div className="font-semibold text-lg flex items-center gap-2">
+                                                        {c.shipment_id} 
+                                                        <span className="text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded uppercase font-bold tracking-wide">NEEDS REVIEW</span>
+                                                    </div>
+                                                    <p className="text-sm text-gray-600 mt-1">
+                                                        Rec: <span className="font-medium text-gray-900">{c.recommended_carrier}</span> | 
+                                                        Cost: <span className="font-medium text-gray-900">USD {c.recommended_cost}</span> | 
+                                                        Score: <span className="font-medium text-gray-900">{c.composite_score}</span>
+                                                    </p>
+                                                </div>
+                                                <button onClick={() => navigate("case", c.thread_id)} className="bg-amber-500 hover:bg-amber-600 text-white px-5 py-2 rounded-lg font-medium transition-colors">Review</button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </section>
+
+                            <section>
+                                <h2 className="text-xl font-semibold mb-4">Recent Activity</h2>
+                                {allCases.length === 0 ? (
+                                    <div className="p-8 bg-white rounded-xl border border-gray-200 text-center text-gray-500 shadow-sm">No recent activity. Trigger a disruption to start.</div>
+                                ) : (
+                                    <div className="bg-white border border-gray-200 rounded-xl shadow-sm divide-y divide-gray-100">
+                                        {allCases.slice(0, 10).map(c => (
+                                            <div key={c.thread_id} onClick={() => navigate("case", c.thread_id)} className="p-4 flex justify-between items-center cursor-pointer hover:bg-gray-50 transition-colors">
+                                                <div className="flex items-center gap-4">
+                                                    <div className="font-medium text-gray-900 w-32">{c.shipment_id}</div>
+                                                    <div className="text-sm text-gray-500 capitalize">{c.trigger_type} trigger</div>
+                                                </div>
+                                                <div className="text-xs font-bold px-2.5 py-1 rounded-full border bg-gray-50 uppercase text-gray-700">{c.status.replace(/_/g, ' ')}</div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </section>
+                        </div>
+
+                        <div className="space-y-4">
+                            <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden sticky top-24">
+                                <div className="bg-brand-900 p-4 text-white flex items-center gap-2">
+                                    <Icon name="AlertCircle" className="w-5 h-5" />
+                                    <h2 className="font-semibold">Simulate Disruption</h2>
+                                </div>
+                                <div className="p-5 space-y-6">
+                                    <div className="space-y-2">
+                                        <label className="text-sm font-medium text-gray-700">Target Shipment (Reactive)</label>
+                                        <select className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-brand-900 outline-none" value={shipmentId} onChange={e => setShipmentId(e.target.value)}>
+                                            <option value="SHP-2026-001">SHP-2026-001 (High Risk)</option>
+                                            <option value="SHP-2026-005">SHP-2026-005 (Low Risk)</option>
+                                        </select>
+                                        <button onClick={triggerReactive} disabled={triggering} className="w-full bg-brand-900 hover:bg-blue-800 text-white py-2 rounded-lg font-medium transition-colors disabled:opacity-50">
+                                            {triggering ? "Triggering..." : "Inject Alert"}
+                                        </button>
+                                    </div>
+                                    <hr className="border-gray-100" />
+                                    <div className="space-y-2">
+                                        <label className="text-sm font-medium text-gray-700">Proactive Scan</label>
+                                        <button onClick={triggerProactive} disabled={triggering} className="w-full bg-white border-2 border-brand-900 text-brand-900 hover:bg-blue-50 py-2 rounded-lg font-medium transition-colors disabled:opacity-50">
+                                            {triggering ? "Scanning..." : "Run Proactive Scan"}
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        function CaseDetail({ threadId, allCases, onRefresh }) {
+            const caseData = allCases.find(c => c.thread_id === threadId);
+            const [detail, setDetail] = useState(null);
+            const [logsExpanded, setLogsExpanded] = useState(false);
+
+            useEffect(() => {
+                const fetchDetail = async () => {
+                    try {
+                        const res = await fetch(`${API_URL}/cases/${threadId}/approval-detail`);
+                        if (res.ok) setDetail(await res.json());
+                    } catch (e) { }
+                };
+                if (caseData?.status === "evaluating_tier" || caseData?.status === "awaiting_approval" || caseData?.status === "approved" || caseData?.status === "rejected" || caseData?.status === "executed") fetchDetail();
+            }, [caseData?.status, threadId]);
+
+            if (!caseData) return <div className="p-8 text-gray-500">Loading...</div>;
+
+            const isAwaiting = caseData.next?.length > 0 || (caseData.status === "evaluating_tier" && detail?.interrupt_payload);
+            const displayStatus = isAwaiting ? "awaiting_approval" : caseData.status;
+
+            const p = detail?.interrupt_payload || {};
+            const routeOptions = p.route_options || caseData.route_options || [];
+            const execution = caseData.execution_result;
+
+            const handleApprove = async (idx) => {
+                await fetch(`${API_URL}/cases/${threadId}/approve`, {
+                    method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ approved_by: "Demo User", selected_option_index: idx })
+                });
+                onRefresh();
+            };
+
+            const handleReject = async () => {
+                await fetch(`${API_URL}/cases/${threadId}/reject`, {
+                    method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ approved_by: "Demo User", reason: "Rejected via UI" })
+                });
+                onRefresh();
+            };
+
+            return (
+                <div className="space-y-6 fade-in pb-20">
+                    <div className="bg-white p-6 rounded-xl border border-gray-200 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4">
+                        <div>
+                            <div className="flex items-center gap-3 mb-2">
+                                <h1 className="text-2xl font-bold text-gray-900">{caseData.shipment_id}</h1>
+                                <span className="text-xs font-bold px-2.5 py-1 rounded-full border bg-gray-100 uppercase">{displayStatus.replace(/_/g, ' ')}</span>
+                            </div>
+                            <div className="flex items-center gap-2 text-sm text-gray-500">
+                                <Icon name="MapPin" className="w-4 h-4" />
+                                <span className="font-medium text-gray-700">{caseData.shipment_details?.origin || "Unknown"}</span>
+                                <Icon name="ArrowRight" className="w-4 h-4" />
+                                <span className="font-medium text-gray-700">{caseData.shipment_details?.destination || "Unknown"}</span>
+                                <span className="mx-2">•</span>
+                                <Icon name="Package" className="w-4 h-4" />
+                                <span className="capitalize">{caseData.trigger_type} trigger</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="bg-white p-8 rounded-xl border border-gray-200 shadow-sm overflow-x-auto">
+                        <StepTracker status={displayStatus} riskTier={caseData.risk_tier} />
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        <div className="lg:col-span-2 space-y-6">
+                            
+                            {routeOptions.length > 0 && <RouteComparisonChart routeOptions={routeOptions} />}
+
+                            {routeOptions.length > 0 && (
+                                <section className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
+                                    <div className="bg-gray-50 px-6 py-4 border-b border-gray-200"><h2 className="text-lg font-semibold text-gray-900">Alternative Routes</h2></div>
+                                    <div className="divide-y divide-gray-100">
+                                        {routeOptions.map((r, i) => {
+                                            const isExec = execution?.confirmed_route_id === r.route_id;
+                                            return (
+                                                <div key={i} className={`p-6 flex flex-col sm:flex-row justify-between gap-4 ${isExec ? 'bg-green-50/30 border-l-4 border-l-green-500' : ''}`}>
+                                                    <div>
+                                                        <div className="flex items-center mb-1">
+                                                            <span className="font-semibold text-gray-900">{r.carrier}</span>
+                                                            <span className="text-sm text-gray-500 ml-2">({r.route_id})</span>
+                                                            {isExec && <span className="bg-green-100 text-green-800 text-xs font-bold px-2 py-0.5 rounded ml-2">EXECUTED</span>}
+                                                            {p.recommended_option?.route_id === r.route_id && !isExec && <span className="bg-blue-100 text-blue-800 text-xs font-bold px-2 py-0.5 rounded ml-2">RECOMMENDED</span>}
+                                                        </div>
+                                                        <p className="text-sm text-gray-600 mb-2">Transit: <span className="font-medium">{r.transit_time_days} days</span></p>
+                                                        <p className="text-sm text-gray-600 italic">"{r.risk_note}"</p>
+                                                    </div>
+                                                    <div className="sm:text-right flex flex-col justify-center">
+                                                        <div className="text-lg font-bold text-gray-900">USD {r.cost != null ? r.cost.toLocaleString() : 'N/A'}</div>
+                                                        <div className="text-xs text-gray-500 mt-1">Score: {r.composite_score != null ? r.composite_score : 'N/A'}</div>
+                                                    </div>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                </section>
+                            )}
+
+                            <section className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
+                                <button onClick={() => setLogsExpanded(!logsExpanded)} className="w-full bg-gray-50 px-6 py-4 border-b border-gray-200 flex items-center justify-between hover:bg-gray-100 transition-colors">
+                                    <h2 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+                                        <Icon name="FileText" className="w-5 h-5 text-gray-500" /> System Audit Log
+                                    </h2>
+                                    <Icon name={logsExpanded ? "ChevronUp" : "ChevronDown"} className="w-5 h-5 text-gray-500" />
+                                </button>
+                                {logsExpanded && (
+                                    <div className="p-6 bg-gray-900 text-gray-300 font-mono text-xs overflow-x-auto">
+                                        {caseData.notes?.map((n, i) => <div key={i} className="mb-2 pb-2 border-b border-gray-800 last:border-0 last:mb-0 last:pb-0 whitespace-pre-wrap">{n}</div>)}
+                                        {(!caseData.notes || caseData.notes.length === 0) && "No logs available."}
+                                    </div>
+                                )}
+                            </section>
+                        </div>
+
+                        <div className="space-y-6">
+                            <section className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+                                <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-4">Decision Context</h3>
+                                <div className="space-y-4">
+                                    <div>
+                                        <p className="text-xs text-gray-500 mb-1">Risk Tier Evaluated</p>
+                                        {caseData.risk_tier ? (
+                                            <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-sm font-semibold ${caseData.risk_tier === 'high' ? 'bg-amber-100 text-amber-800' : 'bg-green-100 text-green-800'}`}>
+                                                <Icon name={caseData.risk_tier === 'high' ? "AlertTriangle" : "ShieldCheck"} className="w-4 h-4" />
+                                                {caseData.risk_tier.toUpperCase()} RISK
+                                            </span>
+                                        ) : <span className="text-sm text-gray-400">Pending</span>}
+                                    </div>
+                                    {caseData.autonomy_threshold_used && (
+                                        <div><p className="text-xs text-gray-500 mb-1">Autonomy Threshold (Score)</p><p className="text-sm font-medium text-gray-900">{caseData.autonomy_threshold_used}</p></div>
+                                    )}
+                                    {p.risk_reasoning && (
+                                        <div className="bg-amber-50 p-3 rounded-lg border border-amber-100">
+                                            <p className="text-xs text-amber-800 font-medium">{p.risk_reasoning.replace(/\[.*?\] /, '')}</p>
+                                        </div>
+                                    )}
+                                </div>
+                            </section>
+
+                            {isAwaiting && p.route_options && (
+                                <section className="bg-amber-50 rounded-xl shadow-sm border border-amber-300 p-6">
+                                    <h2 className="text-lg font-bold text-amber-900 mb-4 flex items-center gap-2"><Icon name="AlertTriangle" className="w-5 h-5" /> Human Review Required</h2>
+                                    <div className="space-y-4">
+                                        <button onClick={() => handleApprove(0)} className="w-full bg-amber-600 hover:bg-amber-700 text-white font-medium py-2.5 px-4 rounded-lg shadow-sm transition-colors">
+                                            Approve Recommended
+                                        </button>
+                                        <button onClick={handleReject} className="w-full bg-white border border-red-200 text-red-600 hover:bg-red-50 font-medium py-2 px-4 rounded-lg transition-colors">
+                                            Reject Reroute
+                                        </button>
+                                    </div>
+                                </section>
+                            )}
+
+                            {execution && (
+                                <section className="bg-green-50 rounded-xl shadow-sm border border-green-200 p-6">
+                                    <div className="flex items-center gap-2 text-green-800 font-semibold mb-3"><Icon name="CheckCircle2" className="w-5 h-5" /> Booking Confirmed</div>
+                                    <div className="space-y-2 text-sm text-green-900">
+                                        <p><span className="opacity-70">ID:</span> <span className="font-medium">{execution.booking_id}</span></p>
+                                        <p><span className="opacity-70">Carrier:</span> <span className="font-medium">{execution.confirmed_carrier}</span></p>
+                                        <p><span className="opacity-70">Cost:</span> <span className="font-medium">USD {execution.confirmed_cost_usd?.toLocaleString()}</span></p>
+                                    </div>
+                                </section>
+                            )}
+
+                            {displayStatus === "rejected" && (
+                                <section className="bg-red-50 rounded-xl shadow-sm border border-red-200 p-6">
+                                    <div className="flex items-center gap-2 text-red-800 font-semibold mb-3"><Icon name="XCircle" className="w-5 h-5" /> Reroute Rejected</div>
+                                    <p className="text-sm text-red-900">The recommended reroute was rejected. No booking was created.</p>
+                                </section>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        function Approvals({ pendingCases, navigate }) {
+            return (
+                <div className="space-y-6 fade-in">
+                    <h1 className="text-2xl font-bold flex items-center gap-2"><Icon name="Clock" className="w-6 h-6 text-amber-500" /> Approvals Queue</h1>
+                    {pendingCases.length === 0 ? (
+                        <div className="p-8 bg-white rounded-xl border border-gray-200 text-center text-gray-500 shadow-sm">No cases awaiting approval.</div>
+                    ) : (
+                        pendingCases.map(c => (
+                            <div key={c.thread_id} className="bg-white p-6 rounded-xl border border-amber-200 shadow-sm flex justify-between items-center border-l-4 border-l-amber-400">
+                                <div>
+                                    <div className="font-bold text-lg">{c.shipment_id}</div>
+                                    <div className="text-sm text-gray-600 mt-1">Recommended Cost: <span className="font-medium text-gray-900">USD {c.recommended_cost}</span></div>
+                                </div>
+                                <button onClick={() => navigate("case", c.thread_id)} className="bg-brand-900 hover:bg-blue-800 text-white px-5 py-2.5 rounded-lg font-medium transition-colors">Review</button>
+                            </div>
+                        ))
+                    )}
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>

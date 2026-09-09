@@ -1,6 +1,7 @@
 import datetime
 import httpx
 from langgraph.graph import StateGraph, START, END
+from langgraph.types import interrupt, Command
 from app.state import ShipmentState
 
 ERP_URL = "http://localhost:8001"
@@ -296,16 +297,345 @@ def generate_alternatives(state: ShipmentState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Phase 5 — Tiered-autonomy thresholds
+#
+# Two independent checks gate the auto-execute path:
+#
+#   AUTO_EXECUTE_SCORE_THRESHOLD  — composite_score of recommended_option.
+#       The composite_score already blends cost, transit time, risk level, AND
+#       penalty exposure into a single 0-1 value, so this is the primary gate.
+#       "Anything with a composite score below 0.40 is low enough complexity
+#       that the agent can proceed without human sign-off."
+#
+#   AUTO_EXECUTE_COST_THRESHOLD   — raw freight cost of recommended_option (USD).
+#       A second, independently legible check a non-technical stakeholder can
+#       immediately understand: "we never auto-book anything over $8,000 in
+#       freight cost, full stop, regardless of score."
+#
+# BOTH conditions must be satisfied for auto-execute.  Either threshold
+# exceeded → high risk → human review.  The thresholds are named constants so
+# they can be changed in one place and demonstrated live without touching logic.
+# ---------------------------------------------------------------------------
+AUTO_EXECUTE_SCORE_THRESHOLD: float = 0.40   # composite_score upper bound for auto-execute
+AUTO_EXECUTE_COST_THRESHOLD:  float = 8000.0 # raw freight cost (USD) upper bound
+
+
+def tiered_autonomy_check(state: ShipmentState) -> dict:
+    """Phase 5 — classify the recommended route as low or high risk.
+
+    Reads recommended_option from state (computed in Phase 4) and compares its
+    composite_score and raw freight cost against the named threshold constants.
+
+    Returns:
+      - risk_tier: "low" | "high"
+      - autonomy_threshold_used: the composite_score threshold applied
+        (recorded for the audit trail)
+      - status: "evaluating_tier"  (momentary; the conditional edge then routes
+        to auto_execute_node or human_review_node which set the final status)
+      - notes: one sentence explaining exactly which threshold was checked and
+        which direction the decision went, so the audit log is self-contained.
+    """
+    ts = datetime.datetime.now().isoformat()
+    rec = state.get("recommended_option") or {}
+
+    score = float(rec.get("composite_score", 1.0))
+    cost  = float(rec.get("cost", 0.0))
+    carrier = rec.get("carrier", "unknown")
+    route_id = rec.get("route_id", "?")
+    risk_note = rec.get("risk_note", "")
+
+    score_ok = score < AUTO_EXECUTE_SCORE_THRESHOLD
+    cost_ok  = cost  < AUTO_EXECUTE_COST_THRESHOLD
+
+    if score_ok and cost_ok:
+        tier = "low"
+        note = (
+            f"[{ts}] Tiered autonomy: LOW RISK — auto-execute approved. "
+            f"Recommended route {carrier} ({route_id}): "
+            f"composite_score={score} < threshold {AUTO_EXECUTE_SCORE_THRESHOLD}, "
+            f"cost=USD{cost:,.0f} < threshold USD{AUTO_EXECUTE_COST_THRESHOLD:,.0f}. "
+            f"Risk note: '{risk_note}'. Proceeding to auto-execute."
+        )
+    else:
+        tier = "high"
+        reasons = []
+        if not score_ok:
+            reasons.append(
+                f"composite_score={score} >= threshold {AUTO_EXECUTE_SCORE_THRESHOLD}"
+            )
+        if not cost_ok:
+            reasons.append(
+                f"cost=USD{cost:,.0f} >= threshold USD{AUTO_EXECUTE_COST_THRESHOLD:,.0f}"
+            )
+        note = (
+            f"[{ts}] Tiered autonomy: HIGH RISK — human review required. "
+            f"Recommended route {carrier} ({route_id}): "
+            f"{'; '.join(reasons)}. "
+            f"Risk note: '{risk_note}'. Routing to human_review_node."
+        )
+
+    return {
+        "risk_tier":               tier,
+        "autonomy_threshold_used": AUTO_EXECUTE_SCORE_THRESHOLD,
+        "status":                  "evaluating_tier",
+        "notes":                   [note],
+    }
+
+
+def _route_after_tier_check(state: ShipmentState) -> str:
+    """Conditional edge function — returns the name of the next node.
+
+    LangGraph calls this after tiered_autonomy_check completes and uses the
+    return value to select the next node.  The two possible targets are:
+      "auto_execute"   — risk_tier is "low"
+      "human_review"   — risk_tier is "high" (or missing / unexpected)
+    """
+    return "auto_execute" if state.get("risk_tier") == "low" else "human_review"
+
+
+def auto_execute_node(state: ShipmentState) -> dict:
+    """Phase 5 — finalise the booking with the ERP mock server.
+
+    Called only on the low-risk path.  Posts the recommended route to the ERP
+    server's execute_reroute endpoint and records the confirmation in state.
+    """
+    ts = datetime.datetime.now().isoformat()
+    shipment_id = state.get("shipment_id", "")
+    rec = state.get("recommended_option") or {}
+
+    payload = {
+        "shipment_id":       shipment_id,
+        "route_id":          rec.get("route_id", ""),
+        "carrier":           rec.get("carrier", ""),
+        "cost_usd":          rec.get("cost", 0.0),
+        "transit_time_days": rec.get("transit_time_days", 0),
+        "context_note":      f"Auto-executed by SupplyChain Sentinel. score={rec.get('composite_score')}",
+    }
+
+    try:
+        resp = httpx.post(
+            f"{ERP_URL}/shipment/execute_reroute",
+            json=payload,
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        confirmation = resp.json()
+    except Exception as e:
+        return {
+            "status": "error",
+            "notes": [f"[{ts}] auto_execute_node failed to book reroute: {str(e)}"],
+        }
+
+    note = (
+        f"[{ts}] Auto-executed: booking confirmed. "
+        f"Booking ID: {confirmation.get('booking_id')}, "
+        f"carrier: {confirmation.get('confirmed_carrier')}, "
+        f"cost: USD{confirmation.get('confirmed_cost_usd', 0):,.0f}, "
+        f"estimated delivery: {confirmation.get('confirmed_delivery_date')}."
+    )
+
+    return {
+        "execution_result": confirmation,
+        "status":           "auto_executed",
+        "notes":            [note],
+    }
+
+
+def human_review_node(state: ShipmentState) -> dict:
+    """Phase 6 — real interrupt for human approval.
+
+    This node genuinely pauses graph execution using LangGraph's interrupt().
+    The graph state is checkpointed to Postgres and can survive a full process
+    restart.  Execution resumes only when the API posts a Command(resume=...)
+    to this thread.
+
+    Behaviour:
+      1. First execution (before interrupt):
+         - Sets approval_requested_at and status = "awaiting_approval"
+         - Appends an audit note
+         - Calls interrupt() with a rich JSON payload for the approval UI
+         - Execution HALTS here — nothing below the interrupt() runs
+
+      2. Second execution (after resume via Command(resume={...})):
+         - The node re-executes from the top (LangGraph re-execution semantics)
+         - interrupt() returns the resume value (the human's decision)
+         - The node stores approval_decision and approved_by in state
+         - Returns updated state; graph continues to finalize_execution_node
+    """
+    ts = datetime.datetime.now().isoformat()
+    rec = state.get("recommended_option") or {}
+    shipment_id = state.get("shipment_id", "")
+    route_options = state.get("route_options", [])
+    shipment_details = state.get("shipment_details", {})
+    risk_tier_note = ""
+    # Find the tier-check note for the approval payload
+    for n in reversed(state.get("notes", [])):
+        if "Tiered autonomy" in n:
+            risk_tier_note = n
+            break
+
+    # Build the approval payload — contains enough info for an approval UI
+    # to render without re-fetching state
+    approval_payload = {
+        "shipment_id":       shipment_id,
+        "shipment_summary":  shipment_details,
+        "route_options":     route_options,
+        "recommended_option": rec,
+        "risk_tier":         state.get("risk_tier"),
+        "risk_reasoning":    risk_tier_note,
+        "approval_requested_at": ts,
+        "message": (
+            f"High-risk reroute requires approval for shipment {shipment_id}. "
+            f"Recommended: {rec.get('carrier', '?')} ({rec.get('route_id', '?')}), "
+            f"cost=USD{rec.get('cost', 0):,.0f}, "
+            f"score={rec.get('composite_score', '?')}. "
+            f"Select an option index (0-based) from route_options to approve, "
+            f"or reject."
+        ),
+    }
+
+    # -----------------------------------------------------------------------
+    # THE INTERRUPT — graph execution genuinely halts here on first call.
+    # On resume, interrupt() returns the value from Command(resume=...).
+    # -----------------------------------------------------------------------
+    human_decision = interrupt(approval_payload)
+
+    # -----------------------------------------------------------------------
+    # AFTER RESUME — human_decision is the dict from Command(resume=...)
+    # Expected shape: {"approval_decision": "approved"|"rejected",
+    #                  "approved_by": str,
+    #                  "selected_option_index": int (for approved),
+    #                  "reason": str (for rejected)}
+    # -----------------------------------------------------------------------
+    decision = human_decision.get("approval_decision", "rejected")
+    approved_by = human_decision.get("approved_by", "unknown")
+
+    if decision == "approved":
+        idx = int(human_decision.get("selected_option_index", 0))
+        if 0 <= idx < len(route_options):
+            selected = route_options[idx]
+        else:
+            selected = rec  # fallback to recommendation if index invalid
+        note = (
+            f"[{datetime.datetime.now().isoformat()}] Human APPROVED reroute. "
+            f"Approved by: {approved_by}. "
+            f"Selected option: {selected.get('carrier')} ({selected.get('route_id')}), "
+            f"cost=USD{selected.get('cost', 0):,.0f}, "
+            f"transit={selected.get('transit_time_days')}d."
+        )
+        return {
+            "approval_decision":    "approved",
+            "approved_by":          approved_by,
+            "approval_requested_at": ts,
+            "recommended_option":   selected,  # override with the human's pick
+            "status":               "approved",
+            "notes":                [note],
+        }
+    else:
+        reason = human_decision.get("reason", "No reason provided")
+        note = (
+            f"[{datetime.datetime.now().isoformat()}] Human REJECTED reroute. "
+            f"Rejected by: {approved_by}. Reason: {reason}. "
+            f"No booking will be submitted."
+        )
+        return {
+            "approval_decision":     "rejected",
+            "approved_by":           approved_by,
+            "approval_requested_at": ts,
+            "status":                "rejected",
+            "notes":                 [note],
+        }
+
+
+def finalize_execution_node(state: ShipmentState) -> dict:
+    """Phase 6 — execute or finalize based on the approval decision.
+
+    This node runs after human_review_node resumes. It checks
+    approval_decision to decide whether to book or skip.
+    """
+    ts = datetime.datetime.now().isoformat()
+    decision = state.get("approval_decision")
+    shipment_id = state.get("shipment_id", "")
+
+    if decision == "rejected":
+        # Nothing to do — human already set status to "rejected"
+        return {
+            "status": "rejected",
+            "notes":  [f"[{ts}] Finalize: skipped booking (decision was 'rejected')."],
+        }
+
+    # decision == "approved" — call ERP to book the selected route
+    rec = state.get("recommended_option") or {}
+    payload = {
+        "shipment_id":       shipment_id,
+        "route_id":          rec.get("route_id", ""),
+        "carrier":           rec.get("carrier", ""),
+        "cost_usd":          rec.get("cost", 0.0),
+        "transit_time_days": rec.get("transit_time_days", 0),
+        "context_note": (
+            f"Human-approved reroute by {state.get('approved_by', '?')}. "
+            f"score={rec.get('composite_score')}"
+        ),
+    }
+
+    try:
+        resp = httpx.post(
+            f"{ERP_URL}/shipment/execute_reroute",
+            json=payload,
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        confirmation = resp.json()
+    except Exception as e:
+        return {
+            "status": "error",
+            "notes":  [f"[{ts}] finalize_execution_node failed: {str(e)}"],
+        }
+
+    note = (
+        f"[{ts}] Booking confirmed after human approval. "
+        f"Booking ID: {confirmation.get('booking_id')}, "
+        f"carrier: {confirmation.get('confirmed_carrier')}, "
+        f"cost: USD{confirmation.get('confirmed_cost_usd', 0):,.0f}, "
+        f"delivery: {confirmation.get('confirmed_delivery_date')}."
+    )
+
+    return {
+        "execution_result": confirmation,
+        "status":           "executed",
+        "notes":            [note],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Graph wiring
-# Phase 3: signal_ingestion → context_gathering
-# Phase 4: → generate_alternatives → END   (Phase 5 replaces END with branch)
+# Phase 3: signal_ingestion -> context_gathering
+# Phase 4: -> generate_alternatives
+# Phase 5: -> tiered_autonomy_check -> [conditional]
+#               low  -> auto_execute          -> END
+# Phase 6:     high -> human_review (interrupt) -> finalize_execution -> END
 # ---------------------------------------------------------------------------
 builder = StateGraph(ShipmentState)
-builder.add_node("signal_ingestion", signal_ingestion)
-builder.add_node("context_gathering", context_gathering)
+builder.add_node("signal_ingestion",      signal_ingestion)
+builder.add_node("context_gathering",     context_gathering)
 builder.add_node("generate_alternatives", generate_alternatives)
+builder.add_node("tiered_autonomy_check", tiered_autonomy_check)
+builder.add_node("auto_execute",          auto_execute_node)
+builder.add_node("human_review",          human_review_node)
+builder.add_node("finalize_execution",    finalize_execution_node)
 
-builder.add_edge(START, "signal_ingestion")
-builder.add_edge("signal_ingestion", "context_gathering")
-builder.add_edge("context_gathering", "generate_alternatives")
-builder.add_edge("generate_alternatives", END)
+builder.add_edge(START,                   "signal_ingestion")
+builder.add_edge("signal_ingestion",      "context_gathering")
+builder.add_edge("context_gathering",     "generate_alternatives")
+builder.add_edge("generate_alternatives", "tiered_autonomy_check")
+
+# Conditional branch: low-risk -> auto_execute, high-risk -> human_review
+builder.add_conditional_edges(
+    "tiered_autonomy_check",
+    _route_after_tier_check,
+    {"auto_execute": "auto_execute", "human_review": "human_review"},
+)
+
+builder.add_edge("auto_execute",       END)
+builder.add_edge("human_review",       "finalize_execution")
+builder.add_edge("finalize_execution", END)
